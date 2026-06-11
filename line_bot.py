@@ -3,6 +3,7 @@
 # รัน: gunicorn line_bot:app
 
 import os
+import re
 import csv
 import time
 import requests
@@ -23,9 +24,16 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 # ===================== Google Sheets Config =====================
 SHEET_ID = "17vP4_JV4TfAu_8V_POc0k9pt4OkIIToRwW74Pp6FjZM"
 SHEET_GIDS = [0, 1984549136, 703469311, 798179661, 1606336018]
-CACHE_TTL = 300  # รีเฟรชข้อมูลทุก 5 นาที
+CACHE_TTL = 300  # รีเฟรชทุก 5 นาที
 
 _cache = {"data": [], "ts": 0}
+
+def extract_qty(val) -> int:
+    """ดึงตัวเลขแรกจาก string เช่น '2 สีขาว' → 2, '1ดำ' → 1"""
+    if val is None or str(val).strip() == "":
+        return 0
+    nums = re.findall(r'\d+', str(val))
+    return int(nums[0]) if nums else 0
 
 def fetch_sheet_csv(gid: int) -> list:
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={gid}"
@@ -40,54 +48,50 @@ def fetch_sheet_csv(gid: int) -> list:
         return []
 
 def parse_sheet(rows: list) -> list:
-    """แปลง CSV rows เป็น stock items อัตโนมัติ"""
     items = []
     if not rows:
         return items
 
-    # ตรวจจับ header row
-    header = [str(c).strip().lower() for c in rows[0]]
-
-    # ตรวจว่าเป็น sheet จอ หรือ แบตต
-    is_battery = any("แบต" in str(r[0]) for r in rows[:5] if r)
+    # ตรวจว่าเป็น sheet แบตต หรือ จอ
+    first_vals = " ".join(str(c) for row in rows[:5] for c in row).lower()
+    is_battery = "แบต" in first_vals and "จอ" not in first_vals[:50]
     cat = "แบตเตอรี่" if is_battery else "จอ"
 
     current_brand = ""
 
-    # หา index ของ columns
-    # Sheet จอ: [brand/cat, model, price, qty]
-    # Sheet แบตต: [brand, model, detail, price, qty]
-
-    for row in rows[1:]:
-        if not any(c for c in row):
+    for row in rows:
+        if not any(str(c).strip() for c in row):
             continue
 
-        # ถ้า col แรกมีข้อความ = brand header
         col0 = str(row[0]).strip() if row[0] else ""
+
+        # ข้าม header rows
+        if col0 in ["จอ IPHONE", "แบต", "IPHONE"] and not row[1]:
+            if col0 not in ["จอ IPHONE", "แบต"]:
+                current_brand = col0
+            continue
+
+        # ถ้า col A มีค่า = brand
         if col0 and col0 not in ["", "จอ IPHONE", "แบต"]:
             current_brand = col0
 
-        # ดึง model
+        # model อยู่ใน col B (index 1)
         model = str(row[1]).strip() if len(row) > 1 and row[1] else ""
-        if not model or model in ["รุ่น", ""]:
+        if not model or model in ["รุ่น", "N", ""]:
             continue
-
         model = model.replace("\n", " / ")
 
-        # ดึง price และ qty ตามโครงสร้าง
-        if is_battery and len(row) >= 5:
-            detail = str(row[2]).strip() if row[2] else ""
-            price = str(row[3]).strip() if row[3] else "-"
-            qty_raw = row[4]
+        # ดึง price และ qty
+        if is_battery:
+            # แบต: A=brand, B=model, C=detail, D=price, E=qty
+            detail = str(row[2]).strip() if len(row) > 2 and row[2] else ""
+            price  = str(row[3]).strip() if len(row) > 3 and row[3] else "-"
+            qty    = extract_qty(row[4] if len(row) > 4 else 0)
         else:
+            # จอ: A=brand, B=model, C=price, D=qty
             detail = ""
-            price = str(row[2]).strip() if len(row) > 2 and row[2] else "-"
-            qty_raw = row[3] if len(row) > 3 else 0
-
-        try:
-            qty = int(float(str(qty_raw))) if qty_raw not in [None, "", " "] else 0
-        except:
-            qty = 0
+            price  = str(row[2]).strip() if len(row) > 2 and row[2] else "-"
+            qty    = extract_qty(row[3] if len(row) > 3 else 0)
 
         item = {
             "cat": cat,
@@ -103,7 +107,6 @@ def parse_sheet(rows: list) -> list:
     return items
 
 def get_stock() -> list:
-    """ดึงข้อมูลจาก cache หรือ fetch ใหม่ถ้าหมดอายุ"""
     now = time.time()
     if now - _cache["ts"] < CACHE_TTL and _cache["data"]:
         return _cache["data"]
@@ -126,7 +129,7 @@ def get_stock() -> list:
 
     return _cache["data"]
 
-# ===================== ฟังก์ชันค้นหา =====================
+# ===================== ค้นหา =====================
 def search_stock(query: str) -> list:
     stock = get_stock()
     q = query.lower().replace(" ", "").replace("-", "").replace("_", "")
@@ -141,8 +144,8 @@ def format_results(results: list, query: str) -> str:
             "  • iphone13\n  • samsung a54\n  • vivo y21\n  • redmi note11"
         )
 
-    screens = [x for x in results if x["cat"] == "จอ"]
-    batteries = [x for x in results if x["cat"] == "แบตเตอรี่"]
+    screens    = [x for x in results if x["cat"] == "จอ"]
+    batteries  = [x for x in results if x["cat"] == "แบตเตอรี่"]
     lines = [f"🔍 ผลค้นหา: \"{query}\" (พบ {len(results)} รายการ)\n"]
 
     if screens:
@@ -188,7 +191,7 @@ def format_help() -> str:
 
 def format_category_summary(cat: str) -> str:
     stock = get_stock()
-    items = [x for x in stock if x["cat"] == cat]
+    items    = [x for x in stock if x["cat"] == cat]
     in_stock = [x for x in items if x["qty"] > 0]
     icon = "📱" if cat == "จอ" else "🔋"
     lines = [f"{icon} สรุปสต็อก{cat} ({len(items)} รายการ)\n"]
