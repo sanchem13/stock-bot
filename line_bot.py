@@ -22,7 +22,7 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # ===================== Google Sheets Config =====================
 SHEET_ID = "17vP4_JV4TfAu_8V_POc0k9pt4OkIIToRwW74Pp6FjZM"
-SHEET_GIDS = [1984549136, 703469311, 798179661, 1606336018]
+SHEET_GIDS = [0, 1984549136, 703469311, 798179661, 1606336018]
 CACHE_TTL = 300  # รีเฟรชข้อมูลทุก 5 นาที
 
 _cache = {"data": [], "ts": 0}
