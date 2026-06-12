@@ -77,12 +77,8 @@ def parse_sheet(rows: list) -> list:
     if not rows:
         return items
 
-    # ตรวจว่าเป็น sheet แบตต หรือ จอ
-    first_vals = " ".join(str(c) for row in rows[:5] for c in row).lower()
-    is_battery = "แบต" in first_vals and "จอ" not in first_vals[:50]
-    cat = "แบตเตอรี่" if is_battery else "จอ"
-
     current_brand = ""
+    current_cat = "จอ"  # default
 
     for row in rows:
         if not any(str(c).strip() for c in row):
@@ -90,14 +86,18 @@ def parse_sheet(rows: list) -> list:
 
         col0 = str(row[0]).strip() if row[0] else ""
 
-        # ข้าม header rows
-        if col0 in ["จอ IPHONE", "แบต", "IPHONE"] and not row[1]:
-            if col0 not in ["จอ IPHONE", "แบต"]:
+        # ถ้า col A มีค่า → อัปเดต brand และ category ตาม col A
+        if col0:
+            col0_lower = col0.lower()
+            if "แบต" in col0_lower:
+                current_cat = "แบตเตอรี่"
+            elif "จอ" in col0_lower or "screen" in col0_lower:
+                current_cat = "จอ"
+            # ข้าม header-only rows (col B ว่าง หรือ เป็น "รุ่น")
+            b_val = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+            if not b_val or b_val in ["รุ่น", "N"]:
                 current_brand = col0
-            continue
-
-        # ถ้า col A มีค่า = brand
-        if col0 and col0 not in ["", "จอ IPHONE", "แบต"]:
+                continue
             current_brand = col0
 
         # model อยู่ใน col B (index 1)
@@ -106,8 +106,8 @@ def parse_sheet(rows: list) -> list:
             continue
         model = model.replace("\n", " / ")
 
-        # ดึง price และ qty
-        if is_battery:
+        # ดึง price และ qty ตาม category ปัจจุบัน
+        if current_cat == "แบตเตอรี่":
             # แบต: A=brand, B=model, C=detail, D=price, E=qty
             detail = str(row[2]).strip() if len(row) > 2 and row[2] else ""
             price  = str(row[3]).strip() if len(row) > 3 and row[3] else "-"
@@ -119,7 +119,7 @@ def parse_sheet(rows: list) -> list:
             qty    = extract_qty(row[3] if len(row) > 3 else 0)
 
         item = {
-            "cat": cat,
+            "cat": current_cat,
             "brand": current_brand,
             "model": model,
             "price": price,
