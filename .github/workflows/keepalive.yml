@@ -1,0 +1,14 @@
+name: Keep Bot Alive
+
+on:
+  schedule:
+    - cron: '*/14 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping bot
+        run: |
+          curl -s https://stock-bot-kulh.onrender.com/ || echo "Ping failed"
