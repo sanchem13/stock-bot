@@ -1,35 +1,53 @@
 # LINE Stock Bot - ดึงข้อมูลจาก Google Sheets แบบ Real-time
-# ติดตั้ง: pip install flask line-bot-sdk gunicorn requests
+# ติดตั้ง: pip install flask gunicorn requests
 # รัน: gunicorn line_bot:app
 
 import os
 import re
 import csv
 import time
+import json
+import hmac
+import hashlib
+import base64
 import requests
 import io
 from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "YOUR_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "YOUR_CHANNEL_SECRET")
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+def verify_signature(body: bytes, signature: str) -> bool:
+    hash_ = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
+    expected = base64.b64encode(hash_).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
+def send_reply(reply_token: str, text: str):
+    """ส่ง reply ไป LINE โดยตรง (bypass SDK เพื่อแก้ UnicodeEncodeError)"""
+    payload = json.dumps(
+        {"replyToken": reply_token, "messages": [{"type": "text", "text": text}]},
+        ensure_ascii=False
+    ).encode("utf-8")
+    requests.post(
+        "https://api.line.me/v2/bot/message/reply",
+        data=payload,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        },
+        timeout=10,
+    )
 
 # ===================== Google Sheets Config =====================
 SHEET_ID = "17vP4_JV4TfAu_8V_POc0k9pt4OkIIToRwW74Pp6FjZM"
 SHEET_GIDS = [0, 1984549136, 703469311, 798179661, 1606336018]
-CACHE_TTL = 300  # รีเฟรชทุก 5 นาที
+CACHE_TTL = 300
 
 _cache = {"data": [], "ts": 0}
 
 def extract_qty(val) -> int:
-    """ดึงตัวเลขแรกจาก string เช่น '2 สีขาว' → 2, '1ดำ' → 1"""
     if val is None or str(val).strip() == "":
         return 0
     nums = re.findall(r'\d+', str(val))
@@ -51,66 +69,42 @@ def parse_sheet(rows: list) -> list:
     items = []
     if not rows:
         return items
-
-    # ตรวจว่าเป็น sheet แบตต หรือ จอ
     first_vals = " ".join(str(c) for row in rows[:5] for c in row).lower()
     is_battery = "แบต" in first_vals and "จอ" not in first_vals[:50]
     cat = "แบตเตอรี่" if is_battery else "จอ"
-
     current_brand = ""
-
     for row in rows:
         if not any(str(c).strip() for c in row):
             continue
-
         col0 = str(row[0]).strip() if row[0] else ""
-
-        # ข้าม header rows
         if col0 in ["จอ IPHONE", "แบต", "IPHONE"] and not row[1]:
             if col0 not in ["จอ IPHONE", "แบต"]:
                 current_brand = col0
             continue
-
-        # ถ้า col A มีค่า = brand
         if col0 and col0 not in ["", "จอ IPHONE", "แบต"]:
             current_brand = col0
-
-        # model อยู่ใน col B (index 1)
         model = str(row[1]).strip() if len(row) > 1 and row[1] else ""
         if not model or model in ["รุ่น", "N", ""]:
             continue
         model = model.replace("\n", " / ")
-
-        # ดึง price และ qty
         if is_battery:
-            # แบต: A=brand, B=model, C=detail, D=price, E=qty
             detail = str(row[2]).strip() if len(row) > 2 and row[2] else ""
             price  = str(row[3]).strip() if len(row) > 3 and row[3] else "-"
             qty    = extract_qty(row[4] if len(row) > 4 else 0)
         else:
-            # จอ: A=brand, B=model, C=price, D=qty
             detail = ""
             price  = str(row[2]).strip() if len(row) > 2 and row[2] else "-"
             qty    = extract_qty(row[3] if len(row) > 3 else 0)
-
-        item = {
-            "cat": cat,
-            "brand": current_brand,
-            "model": model,
-            "price": price,
-            "qty": qty,
-        }
+        item = {"cat": cat, "brand": current_brand, "model": model, "price": price, "qty": qty}
         if detail:
             item["detail"] = detail
         items.append(item)
-
     return items
 
 def get_stock() -> list:
     now = time.time()
     if now - _cache["ts"] < CACHE_TTL and _cache["data"]:
         return _cache["data"]
-
     print("Fetching fresh data from Google Sheets...")
     all_items = []
     for gid in SHEET_GIDS:
@@ -119,17 +113,14 @@ def get_stock() -> list:
             items = parse_sheet(rows)
             all_items.extend(items)
             print(f"  gid={gid}: {len(items)} items")
-
     if all_items:
         _cache["data"] = all_items
         _cache["ts"] = now
         print(f"Total: {len(all_items)} items cached")
     elif _cache["data"]:
         print("Fetch failed, using stale cache")
-
     return _cache["data"]
 
-# ===================== ค้นหา =====================
 def search_stock(query: str) -> list:
     stock = get_stock()
     q = query.lower().replace(" ", "").replace("-", "").replace("_", "")
@@ -138,56 +129,37 @@ def search_stock(query: str) -> list:
 
 def format_results(results: list, query: str) -> str:
     if not results:
-        return (
-            f"❌ ไม่พบสินค้า \"{query}\"\n\n"
-            "💡 ลองพิมพ์ชื่อรุ่น เช่น:\n"
-            "  • iphone13\n  • samsung a54\n  • vivo y21\n  • redmi note11"
-        )
-
-    screens    = [x for x in results if x["cat"] == "จอ"]
-    batteries  = [x for x in results if x["cat"] == "แบตเตอรี่"]
+        return (f"❌ ไม่พบสินค้า \"{query}\"\n\n"
+                "💡 ลองพิมพ์ชื่อรุ่น เช่น:\n"
+                "  iphone13\n  samsung a54\n  vivo y21\n  redmi note11")
+    screens   = [x for x in results if x["cat"] == "จอ"]
+    batteries = [x for x in results if x["cat"] == "แบตเตอรี่"]
     lines = [f"🔍 ผลค้นหา: \"{query}\" (พบ {len(results)} รายการ)\n"]
-
     if screens:
         lines.append("📱 จอ:")
         for item in screens[:10]:
             icon = "✅" if item["qty"] > 0 else "❌"
-            lines.append(
-                f"  {icon} {item['brand']} {item['model']}\n"
-                f"     💰 {item['price']} บ. | 📦 {item['qty']} ชิ้น"
-            )
-
+            lines.append(f"  {icon} {item['brand']} {item['model']}\n     💰 {item['price']} บ. | 📦 {item['qty']} ชิ้น")
     if batteries:
         lines.append("\n🔋 แบตเตอรี่:")
         for item in batteries[:10]:
             icon = "✅" if item["qty"] > 0 else "❌"
             detail = f" ({item['detail']})" if item.get("detail") else ""
-            lines.append(
-                f"  {icon} {item['brand']} {item['model']}{detail}\n"
-                f"     💰 {item['price']} บ. | 📦 {item['qty']} ชิ้น"
-            )
-
+            lines.append(f"  {icon} {item['brand']} {item['model']}{detail}\n     💰 {item['price']} บ. | 📦 {item['qty']} ชิ้น")
     if len(results) > 20:
         lines.append(f"\n⚠️ แสดง 20 รายการแรก จากทั้งหมด {len(results)} รายการ")
-
     return "\n".join(lines)
 
 def format_help() -> str:
-    return (
-        "📋 วิธีใช้งาน Stock Bot\n\n"
-        "🔍 ค้นหาสินค้า: พิมพ์ชื่อรุ่น\n"
-        "ตัวอย่าง:\n"
-        "  • iphone13\n"
-        "  • samsung a54\n"
-        "  • vivo y21\n"
-        "  • redmi note11\n\n"
-        "📊 คำสั่งพิเศษ:\n"
-        "  • จอ → สรุปสต็อกจอทั้งหมด\n"
-        "  • แบต → สรุปสต็อกแบตทั้งหมด\n"
-        "  • รีเฟรช → อัปเดตข้อมูลล่าสุด\n"
-        "  • ช่วย → วิธีใช้\n\n"
-        "✅ = มีสินค้า | ❌ = สินค้าหมด"
-    )
+    return ("📋 วิธีใช้งาน Stock Bot\n\n"
+            "🔍 ค้นหาสินค้า: พิมพ์ชื่อรุ่น\n"
+            "ตัวอย่าง:\n  iphone13\n  samsung a54\n  vivo y21\n  redmi note11\n\n"
+            "📊 คำสั่งพิเศษ:\n"
+            "  จอ -> สรุปสต็อกจอทั้งหมด\n"
+            "  แบต -> สรุปสต็อกแบตทั้งหมด\n"
+            "  รีเฟรช -> อัปเดตข้อมูลล่าสุด\n"
+            "  ช่วย -> วิธีใช้\n\n"
+            "✅ = มีสินค้า | ❌ = สินค้าหมด")
 
 def format_category_summary(cat: str) -> str:
     stock = get_stock()
@@ -198,7 +170,7 @@ def format_category_summary(cat: str) -> str:
     lines.append(f"✅ มีสินค้า: {len(in_stock)} | ❌ หมดสต็อก: {len(items)-len(in_stock)}\n")
     lines.append("📦 สินค้ามีสต็อก (10 อันดับแรก):")
     for item in in_stock[:10]:
-        lines.append(f"  • {item['brand']} {item['model']} | {item['price']} บ. | {item['qty']} ชิ้น")
+        lines.append(f"  {item['brand']} {item['model']} | {item['price']} บ. | {item['qty']} ชิ้น")
     if len(in_stock) > 10:
         lines.append(f"\n  ... อีก {len(in_stock)-10} รายการ — ค้นหาด้วยชื่อรุ่น")
     return "\n".join(lines)
@@ -206,19 +178,20 @@ def format_category_summary(cat: str) -> str:
 # ===================== Webhook =====================
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers["X-Line-Signature"]
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
+    signature = request.headers.get("X-Line-Signature", "")
+    body_bytes = request.get_data()
+    if not verify_signature(body_bytes, signature):
         abort(400)
+    body = json.loads(body_bytes.decode("utf-8"))
+    for ev in body.get("events", []):
+        if ev.get("type") == "message" and ev["message"].get("type") == "text":
+            handle_message(ev)
     return "OK"
 
-@handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    text = event.message.text.strip()
+    text = event["message"]["text"].strip()
     text_lower = text.lower()
-
+    reply_token = event["replyToken"]
     if text_lower in ["help", "ช่วย", "วิธีใช้", "menu", "เมนู"]:
         reply = format_help()
     elif text_lower in ["จอ", "screen", "หน้าจอ"]:
@@ -233,11 +206,7 @@ def handle_message(event):
     else:
         results = search_stock(text)
         reply = format_results(results, text)
-
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply)
-    )
+    send_reply(reply_token, reply)
 
 @app.route("/", methods=["GET"])
 def health():
